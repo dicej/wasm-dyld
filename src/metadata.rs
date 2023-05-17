@@ -64,12 +64,23 @@ struct Export<'a> {
     ty: Type,
 }
 
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 struct MemInfo {
     memory_size: u32,
     memory_alignment: u32,
     table_size: u32,
     table_alignment: u32,
+}
+
+impl Default for MemInfo {
+    fn default() -> Self {
+        Self {
+            memory_size: 0,
+            memory_alignment: 1,
+            table_size: 0,
+            table_alignment: 1,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -224,24 +235,28 @@ impl<'a> Metadata<'a> {
                                     return type_error();
                                 }
                             }
-                            ("GOT.mem", "__heap_base") => {
+                            ("GOT.mem", name) => {
                                 if let TypeRef::Global(GlobalType {
                                     content_type: ValType::I32,
                                     ..
                                 }) = import.ty
                                 {
-                                    result.needs_heap_base = true;
+                                    match name {
+                                        "__heap_base" => result.needs_heap_base = true,
+                                        "__heap_end" => result.needs_heap_end = true,
+                                        _ => result.memory_address_imports.insert(name),
+                                    }
                                 } else {
                                     return type_error();
                                 }
                             }
-                            ("GOT.mem", "__heap_end") => {
+                            ("GOT.func", name) => {
                                 if let TypeRef::Global(GlobalType {
                                     content_type: ValType::I32,
                                     ..
                                 }) = import.ty
                                 {
-                                    result.needs_heap_end = true;
+                                    result.table_address_imports.insert(name)
                                 } else {
                                     return type_error();
                                 }
@@ -272,24 +287,31 @@ impl<'a> Metadata<'a> {
                 Payload::ExportSection(reader) => {
                     let mut exports = ExportSection::new();
                     for export in reader {
-                        result.exports.insert(Export {
-                            name: export.name,
-                            ty: match export.kind {
-                                ExternalKind::Func => Type::Function(FunctionType::try_from(
-                                    function_types[export.index],
-                                )?),
-                                ExternalKind::Global => {
-                                    let ty = global_types[export.index];
-                                    Type::Global {
-                                        ty: ValueType::try_from(ty.content_type),
-                                        mutable: ty.mutable,
+                        match export.name {
+                            "__wasm_apply_data_relocs" => resolve.has_data_relocs = true,
+                            "__wasm_call_ctors" => resolve.has_ctors = true,
+                            _ => result.exports.insert(Export {
+                                name: export.name,
+                                ty: match export.kind {
+                                    ExternalKind::Func => Type::Function(FunctionType::try_from(
+                                        function_types[export.index],
+                                    )?),
+                                    ExternalKind::Global => {
+                                        let ty = global_types[export.index];
+                                        Type::Global {
+                                            ty: ValueType::try_from(ty.content_type),
+                                            mutable: ty.mutable,
+                                        }
                                     }
-                                }
-                                kind => {
-                                    bail!("unsupported export kind for {}: {kind:?}", export.name)
-                                }
-                            },
-                        });
+                                    kind => {
+                                        bail!(
+                                            "unsupported export kind for {}: {kind:?}",
+                                            export.name
+                                        )
+                                    }
+                                },
+                            }),
+                        }
                     }
                 }
 
