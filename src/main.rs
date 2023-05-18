@@ -12,10 +12,12 @@ use {
         path::PathBuf,
     },
     wasm_encoder::{
-        Alias, CodeSection, Component, ComponentAliasSection, ComponentSectionId, ConstExpr,
-        EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, HeapType,
-        ImportSection, InstanceSection, Instruction as Ins, MemArg, MemorySection, MemoryType,
-        Module, ModuleArg, RawSection, RefType, TableSection, TableType, TypeSection, ValType,
+        Alias, CanonicalFunctionSection, CodeSection, Component, ComponentAliasSection,
+        ComponentExportKind, ComponentExportSection, ComponentSectionId, ComponentTypeSection,
+        ConstExpr, EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection,
+        HeapType, ImportSection, InstanceSection, Instruction as Ins, MemArg, MemorySection,
+        MemoryType, Module, ModuleArg, RawSection, RefType, TableSection, TableType, TypeSection,
+        ValType,
     },
 };
 
@@ -483,7 +485,7 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
     let mut instances = InstanceSection::new();
     let mut aliases = ComponentAliasSection::new();
 
-    {
+    let init = {
         let mut module_count = 0;
         let mut add_module = |data: &[u8]| {
             component.section(&RawSection {
@@ -531,24 +533,12 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
         );
 
         let default_items = [
-            ("memory", ExportKind::Memory, env, "memory"),
-            (
-                "__indirect_function_table",
-                ExportKind::Table,
-                env,
-                "__indirect_function_table",
-            ),
-            (
-                "__stack_pointer",
-                ExportKind::Global,
-                env,
-                "__stack_pointer",
-            ),
+            ("memory", ExportKind::Memory, env),
+            ("__indirect_function_table", ExportKind::Table, env),
+            ("__stack_pointer", ExportKind::Global, env),
         ]
         .into_iter()
-        .map(|(name, kind, instance, instance_name)| {
-            (name, kind, add_alias(instance_name, kind, instance))
-        })
+        .map(|(name, kind, instance)| (name, kind, add_alias(name, kind, instance)))
         .collect::<Vec<_>>();
 
         let mut instance_map = HashMap::new();
@@ -608,7 +598,7 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
             );
         }
 
-        instantiate(
+        let init = instantiate(
             &mut instance_count,
             &mut instances,
             add_module(&make_init_module(
@@ -621,14 +611,26 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
                 }))
                 .collect(),
         );
-    }
+
+        add_alias("init", ExportKind::Func, init)
+    };
 
     component.section(&aliases);
     component.section(&instances);
 
-    if true {
-        todo!("generate lifts and lowers for any component types discovered in the libraries");
-    }
+    // todo: wire up component type(s) found in modules, if any
+
+    let mut types = ComponentTypeSection::new();
+    types.function();
+    component.section(&types);
+
+    let mut functions = CanonicalFunctionSection::new();
+    functions.lift(init, 0, []);
+    component.section(&instances);
+
+    let mut exports = ComponentExportSection::new();
+    exports.export("init", "", ComponentExportKind::Func, 0, None);
+    component.section(&exports);
 
     Ok(component.finish())
 }
