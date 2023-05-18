@@ -1,10 +1,25 @@
 #![deny(warnings)]
 
 use {
-    anyhow::{anyhow, Result},
-    std::fs,
-    wasm_encoder::{Component, RawSection},
+    anyhow::{anyhow, bail, Error, Result},
+    clap::Parser as _,
+    metadata::{Export, FunctionType, GlobalType, Metadata, Type, ValueType},
+    std::{
+        cmp::Ordering,
+        collections::{hash_map::Entry, HashMap, HashSet},
+        ffi::OsStr,
+        fs, iter,
+        path::PathBuf,
+    },
+    wasm_encoder::{
+        Alias, CodeSection, Component, ComponentAliasSection, ComponentSectionId, ConstExpr,
+        EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, HeapType,
+        ImportSection, InstanceSection, Instruction as Ins, MemArg, MemorySection, MemoryType,
+        Module, ModuleArg, RawSection, RefType, TableSection, TableType, TypeSection, ValType,
+    },
 };
+
+mod metadata;
 
 const PAGE_SIZE_BYTES: u32 = 65536;
 const STACK_SIZE_BYTES: u32 = PAGE_SIZE_BYTES;
@@ -42,7 +57,7 @@ fn main() -> Result<()> {
                     Ok((
                         path.file_name().and_then(OsStr::to_str).ok_or_else(|| {
                             anyhow!("unable to get file name as UTF-8 from {}", path.display())
-                        }),
+                        })?,
                         fs::read(path)?,
                     ))
                 })
@@ -53,30 +68,38 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn get_and_increment(n: &mut usize) -> usize {
+fn align(a: u32, b: u32) -> u32 {
+    assert!(b.is_power_of_two());
+    (a + (b - 1)) & !(b - 1)
+}
+
+fn get_and_increment(n: &mut u32) -> u32 {
     let v = *n;
     *n += 1;
     v
 }
 
-fn make_env_module(metadata: impl IntoIterator<Item = (&str, &Metadata)>) -> Vec<u8> {
+fn make_env_module<'a>(metadata: impl IntoIterator<Item = (&'a str, &'a Metadata<'a>)>) -> Vec<u8> {
     let mut memory_offset = STACK_SIZE_BYTES;
     let mut table_offset = 0;
     let mut globals = GlobalSection::new();
     let mut exports = ExportSection::new();
-    let mut global_count = 0;
 
     let memory_size = {
-        let mut add_global_export = |name, value, mutable| {
+        let mut global_count = 0;
+        let mut add_global_export = |name: &str, value, mutable| {
             globals.global(
-                GlobalType {
+                wasm_encoder::GlobalType {
                     val_type: ValType::I32,
                     mutable,
                 },
-                ConstExpr::i32_const(value),
+                &ConstExpr::i32_const(i32::try_from(value).unwrap()),
             );
-            exports.export(name, kind: ExportKind::Global, global_count);
-            global_count += 1;
+            exports.export(
+                name,
+                ExportKind::Global,
+                get_and_increment(&mut global_count),
+            );
         };
 
         add_global_export("__stack_pointer", STACK_SIZE_BYTES, true);
@@ -113,12 +136,12 @@ fn make_env_module(metadata: impl IntoIterator<Item = (&str, &Metadata)>) -> Vec
     {
         let mut memories = MemorySection::new();
         memories.memory(MemoryType {
-            minimum: memory_size,
+            minimum: u64::from(memory_size),
             maximum: None,
             memory64: false,
             shared: false,
         });
-        exports.export("memory", kind: ExportKind::Memory, 0);
+        exports.export("memory", ExportKind::Memory, 0);
         module.section(&memories);
     }
 
@@ -132,7 +155,7 @@ fn make_env_module(metadata: impl IntoIterator<Item = (&str, &Metadata)>) -> Vec
             minimum: table_offset,
             maximum: None,
         });
-        exports.export("__indirect_function_table", kind: ExportKind::Table, 0);
+        exports.export("__indirect_function_table", ExportKind::Table, 0);
         module.section(&tables);
     }
 
@@ -142,8 +165,8 @@ fn make_env_module(metadata: impl IntoIterator<Item = (&str, &Metadata)>) -> Vec
     module.finish()
 }
 
-fn make_init_module(
-    metadata: impl IntoIterator<Item = (&str, &Metadata)>,
+fn make_init_module<'a>(
+    metadata: impl IntoIterator<Item = (&'a str, &'a Metadata<'a>)>,
     exports: &HashMap<&Export, &str>,
 ) -> Result<Vec<u8>> {
     let mut module = Module::new();
@@ -167,11 +190,11 @@ fn make_init_module(
     );
 
     let mut global_count = 0;
-    let add_global_import = |imports, module, name, mutable| {
+    let mut add_global_import = |imports: &mut ImportSection, module: &str, name: &str, mutable| {
         imports.import(
             module,
             name,
-            GlobalType {
+            wasm_encoder::GlobalType {
                 val_type: ValType::I32,
                 mutable,
             },
@@ -180,9 +203,9 @@ fn make_init_module(
     };
 
     let mut function_count = 0;
-    let add_function_import = |imports, module, name| {
+    let mut add_function_import = |imports: &mut ImportSection, module, name| {
         imports.import(module, name, EntityType::Function(0));
-        get_and_increment(&mut global_count)
+        get_and_increment(&mut function_count)
     };
 
     let mut memory_address_inits = Vec::new();
@@ -213,11 +236,11 @@ fn make_init_module(
             )));
         }
 
-        let make_init = |import, inits, base| {
+        let mut make_init = |import, inits: &mut Vec<Ins>, base| {
             inits.push(Ins::GlobalGet(base));
             inits.push(Ins::GlobalGet(add_global_import(
                 &mut imports,
-                find_offset_exporter(import)?,
+                find_offset_exporter(import, exports)?,
                 import,
                 false,
             )));
@@ -228,14 +251,16 @@ fn make_init_module(
                 &format!("{name}:{import}"),
                 true,
             )));
+
+            Ok::<_, Error>(())
         };
 
         for import in &metadata.memory_address_imports {
-            make_init(import, &mut memory_address_inits, memory_base);
+            make_init(import, &mut memory_address_inits, memory_base)?;
         }
 
         for import in &metadata.table_address_imports {
-            make_init(import, &mut table_address_inits, table_base);
+            make_init(import, &mut table_address_inits, table_base)?;
         }
     }
 
@@ -248,6 +273,7 @@ fn make_init_module(
     let mut code_section = CodeSection::new();
     let mut function = Function::new([]);
     for ins in memory_address_inits
+        .iter()
         .chain(&table_address_inits)
         .chain(&reloc_calls)
         .chain(&ctor_calls)
@@ -264,14 +290,15 @@ fn make_init_module(
 fn find_offset_exporter<'a>(name: &str, exports: &HashMap<&Export, &'a str>) -> Result<&'a str> {
     let export = Export {
         name,
-        ty: Type::Global {
+        ty: Type::Global(GlobalType {
             ty: ValueType::I32,
             mutable: false,
-        },
+        }),
     };
 
     exports
         .get(&export)
+        .copied()
         .ok_or_else(|| anyhow!("unable to find {export:?} in any library"))
 }
 
@@ -287,12 +314,13 @@ fn find_function_exporter<'a>(
 
     exports
         .get(&export)
+        .copied()
         .ok_or_else(|| anyhow!("unable to find {export:?} in any library"))
 }
 
 fn resolve_exports<'a>(
-    metadata: impl IntoIterator<Item = (&'a str, &'a Metadata)>,
-) -> Result<HashMap<&'a Export, &'a str>> {
+    metadata: impl IntoIterator<Item = (&'a str, &'a Metadata<'a>)>,
+) -> Result<HashMap<&'a Export<'a>, &'a str>> {
     let mut exports = HashMap::new();
     for (name, metadata) in metadata {
         for export in &metadata.exports {
@@ -301,9 +329,20 @@ fn resolve_exports<'a>(
                 Entry::Occupied(entry) => {
                     bail!("duplicate export in {name} and {}: {export:?}", entry.get())
                 }
-                Entry::Vacant(entry) => entry.insert(name),
+                Entry::Vacant(entry) => {
+                    entry.insert(name);
+                }
             }
         }
+    }
+    Ok(exports)
+}
+
+fn mem_arg(offset: u64, align: u32) -> MemArg {
+    MemArg {
+        offset,
+        align,
+        memory_index: 0,
     }
 }
 
@@ -315,7 +354,7 @@ fn make_wasi_stub(name: &str) -> Vec<Ins> {
             // *time = 0;
             Ins::LocalGet(2),
             Ins::I64Const(0),
-            Ins::I64Store(bindgen::mem_arg(0, 3)),
+            Ins::I64Store(mem_arg(0, 3)),
             // return ERRNO_SUCCESS;
             Ins::I32Const(0),
         ],
@@ -323,11 +362,11 @@ fn make_wasi_stub(name: &str) -> Vec<Ins> {
             // *environc = 0;
             Ins::LocalGet(0),
             Ins::I32Const(0),
-            Ins::I32Store(bindgen::mem_arg(0, 2)),
+            Ins::I32Store(mem_arg(0, 2)),
             // *environ_buf_size = 0;
             Ins::LocalGet(1),
             Ins::I32Const(0),
-            Ins::I32Store(bindgen::mem_arg(0, 2)),
+            Ins::I32Store(mem_arg(0, 2)),
             // return ERRNO_SUCCESS;
             Ins::I32Const(0),
         ],
@@ -349,12 +388,12 @@ fn make_wasi_module(metadata: &[Metadata]) -> Vec<u8> {
     for metadata in metadata {
         for (name, ty) in &metadata.wasi_imports {
             types.function(
-                ty.parameters.iter().copied().map(ValType::into),
-                ty.results.iter().copied().map(ValType::into),
+                ty.parameters.iter().copied().map(ValType::from),
+                ty.results.iter().copied().map(ValType::from),
             );
             functions.function(count);
             let mut function = Function::new([]);
-            for ins in &make_wasi_stub(*name) {
+            for ins in &make_wasi_stub(name) {
                 function.instruction(ins);
             }
             code_section.function(&function);
@@ -369,14 +408,14 @@ fn make_wasi_module(metadata: &[Metadata]) -> Vec<u8> {
     module.finish()
 }
 
-fn topo_sort(
-    metadata: impl IntoIterator<Item = (&str, &Metadata)>,
+fn topo_sort<'a>(
+    metadata: impl IntoIterator<Item = (&'a str, &'a Metadata<'a>)>,
     exports: &HashMap<&Export, &str>,
 ) -> Result<Vec<usize>> {
-    let mut needs = HashMap::new();
+    let mut needs = HashMap::<&str, HashSet<&str>>::new();
     let mut names = Vec::new();
     for (index, (name, metadata)) in metadata.into_iter().enumerate() {
-        names.insert((name, index));
+        names.push((name, index));
         for (name, ty) in &metadata.env_imports {
             needs
                 .entry(name)
@@ -385,10 +424,10 @@ fn topo_sort(
         }
     }
 
-    let empty = &HashMap::new();
+    let empty = &HashSet::new();
 
     loop {
-        let mut new = HashMap::new();
+        let mut new = HashMap::<&str, HashSet<&str>>::new();
         for (name, exporters) in &needs {
             for exporter in exporters {
                 for exporter in needs.get(exporter).unwrap_or(empty) {
@@ -414,7 +453,7 @@ fn topo_sort(
         }
     }
 
-    indexes.sort_by(|a, b| {
+    names.sort_by(|a, b| {
         if needs.get(a.0).unwrap_or(empty).contains(b.0) {
             Ordering::Greater
         } else if needs.get(b.0).unwrap_or(empty).contains(a.0) {
@@ -424,7 +463,7 @@ fn topo_sort(
         }
     });
 
-    Ok(indexes.into_iter().map(|(_, index)| index).collect())
+    Ok(names.into_iter().map(|(_, index)| index).collect())
 }
 
 fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
@@ -446,7 +485,7 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
 
     {
         let mut module_count = 0;
-        let add_module = |data| {
+        let mut add_module = |data: &[u8]| {
             component.section(&RawSection {
                 id: ComponentSectionId::CoreModule.into(),
                 data,
@@ -455,7 +494,7 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
         };
 
         let mut alias_count = 0;
-        let add_alias = |name, kind, instance| {
+        let mut add_alias = |name: &str, kind, instance| {
             aliases.alias(Alias::CoreInstanceExport {
                 instance,
                 kind,
@@ -465,28 +504,30 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
         };
 
         let mut instance_count = 0;
-        let export_items = |count, items| {
+        let export_items = |count: &mut u32, instances: &mut InstanceSection, items| {
             instances.export_items(items);
             get_and_increment(count)
         };
 
-        let instantiate = |count, module, args| {
+        let instantiate = |count: &mut u32, instances: &mut InstanceSection, module, args| {
             instances.instantiate(module, args);
             get_and_increment(count)
         };
 
         let wasi = instantiate(
             &mut instance_count,
+            &mut instances,
             add_module(&make_wasi_module(&metadata)),
-            [],
+            Vec::new(),
         );
 
         let env = instantiate(
             &mut instance_count,
+            &mut instances,
             add_module(&make_env_module(
                 libraries.iter().map(|(name, _)| *name).zip(&metadata),
             )),
-            [],
+            Vec::new(),
         );
 
         let default_items = [
@@ -513,71 +554,81 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
         let mut instance_map = HashMap::new();
         for index in topo_sorted {
             let (name, module) = &libraries[index];
+
+            let memory_base = format!("{name}:memory_base");
+            let table_base = format!("{name}:table_base");
+
             let my_env = export_items(
                 &mut instance_count,
-                default_items.into_iter().chain(
-                    [
-                        (
-                            "__memory_base",
-                            ExportKind::Global,
-                            env,
-                            &format!("{name}:memory_base"),
-                        ),
-                        (
-                            "__table_base",
-                            ExportKind::Global,
-                            env,
-                            &format!("{name}:table_base"),
-                        ),
-                    ]
-                    .into_iter()
-                    .chain(metadata[index].env_imports.iter().map(|(name, ty)| {
-                        (
-                            name,
-                            ExportKind::Func,
-                            instance_map
-                                .get(find_function_exporter(name, ty, exports).unwrap())
-                                .unwrap(),
-                            name,
-                        )
-                    }))
-                    .map(|(name, kind, instance, instance_name)| {
-                        (name, kind, add_alias(instance_name, kind, instance))
-                    }),
-                ),
+                &mut instances,
+                default_items
+                    .iter()
+                    .copied()
+                    .chain(
+                        [
+                            (
+                                "__memory_base",
+                                ExportKind::Global,
+                                env,
+                                memory_base.as_str(),
+                            ),
+                            ("__table_base", ExportKind::Global, env, table_base.as_str()),
+                        ]
+                        .into_iter()
+                        .chain(metadata[index].env_imports.iter().map(|(name, ty)| {
+                            (
+                                *name,
+                                ExportKind::Func,
+                                *instance_map
+                                    .get(&find_function_exporter(name, ty, &exports).unwrap())
+                                    .unwrap(),
+                                *name,
+                            )
+                        }))
+                        .map(|(name, kind, instance, instance_name)| {
+                            (name, kind, add_alias(instance_name, kind, instance))
+                        }),
+                    )
+                    .collect::<Vec<_>>(),
             );
 
             instance_map.insert(
                 name,
                 instantiate(
                     &mut instance_count,
+                    &mut instances,
                     add_module(module),
-                    [
+                    vec![
                         ("GOT.mem", ModuleArg::Instance(env)),
                         ("GOT.func", ModuleArg::Instance(env)),
                         ("wasi_snapshot_preview1", ModuleArg::Instance(wasi)),
-                        ("env", my_env),
+                        ("env", ModuleArg::Instance(my_env)),
                     ],
                 ),
             );
         }
 
-        let init = instantiate(
+        instantiate(
             &mut instance_count,
+            &mut instances,
             add_module(&make_init_module(
                 libraries.iter().map(|(name, _)| *name).zip(&metadata),
                 &exports,
             )?),
-            iter::once(("env", ModuleArg::Instance(env))).chain(
-                libraries
-                    .iter()
-                    .map(|(name, _)| (name, instance_map.get(name).unwrap())),
-            ),
+            iter::once(("env", ModuleArg::Instance(env)))
+                .chain(libraries.iter().map(|(name, _)| {
+                    (*name, ModuleArg::Instance(*instance_map.get(name).unwrap()))
+                }))
+                .collect(),
         );
     }
 
     component.section(&aliases);
     component.section(&instances);
+
+    if true {
+        todo!("generate lifts and lowers for any component types discovered in the libraries");
+    }
 
     Ok(component.finish())
 }
