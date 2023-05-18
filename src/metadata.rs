@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 enum ValueType {
     I32,
     I64,
@@ -231,6 +231,24 @@ impl<'a> Metadata<'a> {
                                 }) = import.ty
                                 {
                                     result.needs_stack_pointer = true;
+                                } else {
+                                    return type_error();
+                                }
+                            }
+                            ("env", name) => {
+                                if let TypeRef::Func(ty) = import.ty {
+                                    result
+                                        .env_imports
+                                        .insert((name, FunctionType::try_from(types[*ty])?));
+                                } else {
+                                    return type_error();
+                                }
+                            }
+                            ("wasi_snapshot_preview1", name) => {
+                                if let TypeRef::Func(ty) = import.ty {
+                                    result
+                                        .wasi_imports
+                                        .insert((name, FunctionType::try_from(types[*ty])?));
                                 } else {
                                     return type_error();
                                 }
