@@ -12,11 +12,10 @@ use {
         path::PathBuf,
     },
     wasm_encoder::{
-        Alias, CanonicalFunctionSection, CodeSection, Component, ComponentAliasSection,
-        ComponentExportKind, ComponentExportSection, ComponentSectionId, ComponentTypeSection,
-        ConstExpr, EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection,
-        HeapType, ImportSection, InstanceSection, Instruction as Ins, MemArg, MemorySection,
-        MemoryType, Module, ModuleArg, RawSection, RefType, TableSection, TableType, TypeSection,
+        Alias, CodeSection, Component, ComponentAliasSection, ComponentSectionId, ConstExpr,
+        EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, HeapType,
+        ImportSection, InstanceSection, Instruction as Ins, MemArg, MemorySection, MemoryType,
+        Module, ModuleArg, RawSection, RefType, StartSection, TableSection, TableType, TypeSection,
         ValType,
     },
 };
@@ -286,6 +285,8 @@ fn make_init_module<'a>(
     code_section.function(&function);
     module.section(&code_section);
 
+    module.section(&StartSection { function_index: 0 });
+
     Ok(module.finish())
 }
 
@@ -485,7 +486,7 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
     let mut instances = InstanceSection::new();
     let mut aliases = ComponentAliasSection::new();
 
-    let init = {
+    {
         let mut module_count = 0;
         let mut add_module = |data: &[u8]| {
             component.section(&RawSection {
@@ -598,7 +599,7 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
             );
         }
 
-        let init = instantiate(
+        instantiate(
             &mut instance_count,
             &mut instances,
             add_module(&make_init_module(
@@ -611,26 +612,174 @@ fn link(libraries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
                 }))
                 .collect(),
         );
-
-        add_alias("init", ExportKind::Func, init)
-    };
+    }
 
     component.section(&aliases);
     component.section(&instances);
 
     // todo: wire up component type(s) found in modules, if any
 
-    let mut types = ComponentTypeSection::new();
-    types.function();
-    component.section(&types);
-
-    let mut functions = CanonicalFunctionSection::new();
-    functions.lift(init, 0, []);
-    component.section(&instances);
-
-    let mut exports = ComponentExportSection::new();
-    exports.export("init", "", ComponentExportKind::Func, 0, None);
-    component.section(&exports);
-
     Ok(component.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    const FOO: &str = r#"
+(module
+  (type (func))
+  (type (func (param i32) (result i32)))
+  (import "env" "memory" (memory 1))
+  (import "env" "__indirect_function_table" (table 0 funcref))
+  (import "env" "__stack_pointer" (global $__stack_pointer (mut i32)))
+  (import "env" "__memory_base" (global $__memory_base i32))
+  (import "env" "__table_base" (global $__table_base i32))
+  (import "env" "malloc" (func $malloc (type 0)))
+  (import "env" "abort" (func $abort (type 1)))
+  (import "GOT.mem" "um" (global $um (mut i32)))
+  (func $__wasm_call_ctors (type 0))
+  (func $__wasm_apply_data_relocs (type 0))
+  (func $foo (type 1) (param i32) (result i32)
+    global.get $__stack_pointer
+    i32.const 16
+    i32.sub
+    global.set $__stack_pointer
+
+    i32.const 4
+    call $malloc
+
+    block ;; label = @1
+      br_if 0 (;@1;)
+      call $abort
+      unreachable
+    end
+
+    local.get 0
+    global.get $um
+    i32.load offset=16
+    i32.add
+    i32.const 42
+    i32.add
+
+    global.get $__stack_pointer
+    i32.const 16
+    i32.add
+    global.set $__stack_pointer
+  )
+  (global i32 i32.const 0)
+  (export "__wasm_call_ctors" (func $__wasm_call_ctors))
+  (export "__wasm_apply_data_relocs" (func $__wasm_apply_data_relocs))
+  (export "foo" (func $foo))
+  (export "well" (global 3))
+  (data $.data (global.get $__memory_base) "\05\00\00\00")
+)
+"#;
+
+    const BAR: &str = r#"
+(module
+  (type (func (param i32) (result i32)))
+  (type (func))
+  (import "env" "memory" (memory 1))
+  (import "env" "__indirect_function_table" (table 0 funcref))
+  (import "env" "__memory_base" (global $__memory_base i32))
+  (import "env" "__table_base" (global $__table_base i32))
+  (import "env" "foo" (func $foo (type 0)))
+  (import "GOT.mem" "well" (global $well (mut i32)))
+  (func $__wasm_call_ctors (type 1))
+  (func $__wasm_apply_data_relocs (type 1))
+  (func $bar (type 0) (param i32) (result i32)
+    (local i32)
+    global.get $well
+    local.set 1
+    local.get 0
+    call $foo
+    local.get 1
+    i32.load
+    i32.add
+  )
+  (global i32 i32.const 0)
+  (export "__wasm_call_ctors" (func $__wasm_call_ctors))
+  (export "__wasm_apply_data_relocs" (func $__wasm_apply_data_relocs))
+  (export "bar" (func $bar))
+  (export "um" (global 3))
+  (data $.data (global.get $__memory_base) "\01\00\00\00\02\00\00\00\03\00\00\00\04\00\00\00\05\00\00\00")
+)
+"#;
+
+    const LIBC: &str = r#"
+(module
+  (type (func))
+  (type (func (param i32) (result i32)))
+  (import "GOT.mem" "__heap_base" (global $__heap_base (mut i32)))
+  (import "GOT.mem" "__heap_end" (global $__heap_end (mut i32)))
+  (global $heap (mut i32) i32.const 0)
+  (func $start (type 0)
+    global.get $__heap_base
+    global.set $heap
+  )
+  (func $malloc (type 1) (param i32) (result i32)
+    global.get $heap
+    global.get $heap
+    local.get 0
+    i32.add
+    global.set $heap
+  )
+  (func $abort (type 0)
+    unreachable
+  )
+  (export "malloc" (func $malloc))
+  (export "abort" (func $abort))
+  (start $start)
+"#;
+
+    #[test]
+    fn it_works() -> Result<()> {
+        let (component, instance_map, aliases) = link(
+            [("libfoo.so", FOO), ("libbar.so", BAR), ("libc.so", LIBC)]
+                .into_iter()
+                .map(|(name, wat)| Ok((name, wat::parse_str(wat)?)))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+
+        todo!("no need to keep track of counts for most things; use `len` instead");
+
+        let bar = aliases.len();
+        aliases.alias(Alias::CoreInstanceExport {
+            instance: *instance_map.get("libbar.so").unwrap(),
+            kind: ExportKind::Func,
+            name: "bar",
+        });
+
+        let mut types = ComponentTypeSection::new();
+        types
+            .function()
+            .params(["v", PrimitiveValType::S32])
+            .result(PrimitiveValType::S32);
+        component.section(&types);
+
+        let mut functions = CanonicalFunctionSection::new();
+        functions.lift(bar, 0, []);
+        component.section(&instances);
+
+        let mut exports = ComponentExportSection::new();
+        exports.export("init", "", ComponentExportKind::Func, 0, None);
+        component.section(&exports);
+
+        let component = component.finish();
+
+        wasmparser::validate(&component)?;
+
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+
+        let engine = Engine::new(&config).unwrap();
+        let mut linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &Component::new(&engine, &component)?)?;
+        let func = instance
+            .exports(&mut store)
+            .ok_or_else(|| anyhow!("no inbound-http instance found"))?
+            .typed_func::<(i32,), (i32,)>("bar")?;
+
+        assert_eq!(42, func.call(&mut store, (7,))?);
+    }
 }
